@@ -1,0 +1,41 @@
+# These scale defaults are only the UI/MotionRequest defaults.
+# Your script still controls scaling at runtime.
+default_velocity_scaling_factor: 0.3
+default_acceleration_scaling_factor: 0.3
+
+joint_limits:
+  joint1:
+    has_velocity_limits: true
+    max_velocity: 8.0  # Further increased for CHOMP
+    has_acceleration_limits: true
+    max_acceleration: 8.0  # Further increased for CHOMP
+  joint2:
+    has_velocity_limits: true
+    max_velocity: 8.0  # Further increased for CHOMP
+    has_acceleration_limits: true
+    max_acceleration: 8.0  # Further increased for CHOMP
+  joint3:
+    has_velocity_limits: true
+    max_velocity: 8.0  # Further increased for CHOMP
+    has_acceleration_limits: true
+    max_acceleration: 8.0  # Further increased for CHOMP
+  joint4:
+    has_velocity_limits: true
+    max_velocity: 8.0
+    has_acceleration_limits: true
+    max_acceleration: 8.0
+  joint5:
+    has_velocity_limits: true
+    max_velocity: 8.0
+    has_acceleration_limits: true
+    max_acceleration: 8.0
+  joint6:
+    has_velocity_limits: true
+    max_velocity: 6.0  # Further increased for CHOMP
+    has_acceleration_limits: true
+    max_acceleration: 8.0
+  joint7:
+    has_velocity_limits: true
+    max_velocity: 2.0  # Further increased for CHOMP
+    has_acceleration_limits: true
+    max_acceleration: 4.0

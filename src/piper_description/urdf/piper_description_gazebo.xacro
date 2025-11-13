@@ -631,4 +631,82 @@
     </plugin>
   </gazebo>
  
+<!-- Lidar sensor mounted on top of link6, lying flat on its bottom -->
+  <link name="lidar_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.1"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <!-- Cylinder: radius 0.08, height 0.03 - will lie flat on circular bottom -->
+      <geometry>
+        <cylinder radius="0.08" length="0.03"/>
+      </geometry>
+      <material name="lidar_material">
+        <color rgba="0.2 0.2 0.2 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.08" length="0.03"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="lidar_joint" type="fixed">
+    <parent link="link6"/>
+    <child link="lidar_link"/>
+    <!-- Position: on top of link6, vertical orientation (lying flat on circular bottom) -->
+    <!-- rpy: 0 0 0 = vertical cylinder, circular face down (lying flat on bottom) -->
+    <origin xyz="-0.05 0.0 0.0" rpy="1.5708 1.5708 1.5708"/>
+  </joint>
+
+  <!-- Gazebo lidar plugin - 3D ray sensor outputs PointCloud2 for MoveIt -->
+  <gazebo reference="lidar_link">
+    <material>Gazebo/Black</material>
+    <sensor type="ray" name="lidar_sensor">
+      <pose>0 0 0 0 0 0</pose>
+      <visualize>false</visualize>
+      <update_rate>10</update_rate>
+      <ray>
+        <scan>
+          <horizontal>
+            <samples>720</samples>
+            <resolution>1</resolution>
+            <min_angle>-3.14159</min_angle>
+            <max_angle>3.14159</max_angle>
+          </horizontal>
+          <vertical>
+            <samples>16</samples>
+            <resolution>1</resolution>
+            <min_angle>-0.261799</min_angle>
+            <max_angle>0.261799</max_angle>
+          </vertical>
+        </scan>
+        <range>
+          <min>0.10</min>
+          <max>30.0</max>
+          <resolution>0.01</resolution>
+        </range>
+        <noise>
+          <type>gaussian</type>
+          <mean>0.0</mean>
+          <stddev>0.01</stddev>
+        </noise>
+      </ray>
+      <plugin name="gazebo_ros_lidar_controller" filename="libgazebo_ros_ray_sensor.so">
+        <ros>
+          <namespace>/</namespace>
+          <remapping>~/out:=/lidar/points</remapping>
+        </ros>
+        <output_type>sensor_msgs/PointCloud2</output_type>
+        <frame_name>lidar_link</frame_name>
+      </plugin>
+    </sensor>
+  </gazebo>
+ 
+
 </robot>

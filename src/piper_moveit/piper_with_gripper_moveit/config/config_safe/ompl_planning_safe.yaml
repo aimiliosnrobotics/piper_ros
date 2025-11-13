@@ -1,0 +1,52 @@
+# This file is loaded under the "ompl" param namespace by the launch.
+# Do NOT nest another "ompl:" key here.
+
+planner_configs:
+  RRTConnectkConfigDefault:
+    type: geometric::RRTConnect
+    range: 0.15
+    goal_bias: 0.05
+    # RRTConnect is better for orientation constraints
+    max_planning_time: 30.0
+    planning_time_limit: 30.0
+
+  RRTConnect:
+    type: geometric::RRTConnect
+    range: 0.2  # Increased range for better exploration
+    goal_bias: 0.1  # Slightly higher goal bias for orientation
+    max_planning_time: 30.0
+    planning_time_limit: 30.0
+    # RRTConnect specific parameters
+    use_projected_state_space: true
+    use_constrained_planning: false  # Disable for better performance
+
+  RRTstar:
+    type: geometric::RRTstar
+    range: 0.15  # Increased for smoother paths
+    goal_bias: 0.05
+    rewire_factor: 1.1  # More rewiring for smoother paths
+    use_k_nearest: true  # Use k-nearest for better connectivity
+    k_nearest: 2  # Number of nearest neighbors
+    delay_collision_checking: 1  # Delay collision checking for speed
+
+  PRMstar:
+    type: geometric::PRMstar
+    max_nearest_neighbors: 20  # Increased for better connectivity
+    max_nearest_neighbors_radius: 0.15  # Increased radius
+    use_k_nearest: true
+    k_nearest: 3
+
+arm:
+  default_planner_config: RRTConnectkConfigDefault
+  planner_configs:
+    - RRTConnectkConfigDefault
+    - RRTConnect
+    - RRTstar
+    - PRMstar
+  # These two help with sampling/projections
+  projection_evaluator: joints(joint1,joint2)
+  longest_valid_segment_fraction: 0.005
+  enforce_joint_model_state_space: true
+  # Planning time limits (in seconds)
+  planning_time_limit: 30.0  # Increased from default 5.0
+  max_planning_time: 60.0    # Maximum time for complex planning
