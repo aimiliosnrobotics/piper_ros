@@ -10,11 +10,13 @@ find_package(ament_cmake REQUIRED)
 find_package(rclpy REQUIRED)
 
 find_package(rosidl_default_generators REQUIRED)
+find_package(geometry_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/PiperStatusMsg.msg"  
   "msg/PosCmd.msg"
   "srv/Enable.srv"
-  DEPENDENCIES # Add packages that above messages depend on, in this case geometry_msgs for Sphere.msg
+  "srv/GraspFromPose.srv"
+  DEPENDENCIES geometry_msgs
 )
 
 if(BUILD_TESTING)
