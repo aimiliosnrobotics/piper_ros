@@ -247,6 +247,7 @@ def _add_ros2_control(ld: LaunchDescription, moveit_config):
             moveit_config.robot_description,
             {"use_sim_time": LaunchConfiguration("use_sim_time")},
             str(moveit_config.package_path / "config/ros2_controllers.yaml"),
+            condition=IfCondition(LaunchConfiguration('start_ros2_control')),
         ],
         output="screen",
     )

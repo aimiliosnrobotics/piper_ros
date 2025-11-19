@@ -6,6 +6,12 @@ bool grasp
 # If true, the orientation of the pose will be ignored
 bool no_orientation
 
+# If true, inverse gripper logic (close before, open after)
+bool place
+
+# If true, after reaching the final pose, snap joint6 to 1.528 rad, then perform the "after" gripper move
+bool vertical
+
 # The pose from which to attempt the grasp
 geometry_msgs/PoseStamped pose
 

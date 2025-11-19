@@ -2,11 +2,19 @@
 """
 ROS2 Service Node for Arm Planning on Real Robot
 Wraps plan_6d_real_robot.py functionality as a service server
+
+New:
+- request.place   -> inverse gripper logic (close before, open after)
+- request.vertical -> after reaching the final pose, rotate ONLY joint6 so that
+                      link6.x becomes parallel to base_link.y (±), then perform
+                      the "after" gripper move.
+- Grasp-only sequence (grasp=True, place=False):
+    open -> (x-0.10, y, z) -> align link6.x || base_link.y -> (x, y, z) -> close
 """
 
 import math
 import time
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 import rclpy
 from rclpy.node import Node
@@ -27,7 +35,7 @@ from piper_msgs.srv import GraspFromPose
 
 # Configuration constants
 ARM_GROUP = "arm"
-EE_LINK = "link8"
+EE_LINK = "link6"
 BASE_FRAME = "base_link"
 ARM_JOINTS = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
 GRIPPER_JOINT = "joint7"
@@ -68,7 +76,31 @@ class ArmPlannerRealRobotNode(Node):
         self.declare_parameter('arm_group', ARM_GROUP)
         self.declare_parameter('gripper_joint', GRIPPER_JOINT)
 
-        # Get parameters
+        # IK / planning params
+        self.declare_parameter('ik_timeout', 0.3)              # seconds
+        self.declare_parameter('ik_attempts', 3)               # kept for future use
+        self.declare_parameter('ik_avoid_collisions', True)
+
+        # Joint tolerance (either per-side or a single deg value)
+        self.declare_parameter('joint_tolerance_above', 0.02)  # radians
+        self.declare_parameter('joint_tolerance_below', 0.02)  # radians
+        self.declare_parameter('joint_tolerance_deg', 0.0)     # if >0, overrides both above/below
+
+        # Gripper open/close distances (meters)
+        self.declare_parameter('gripper_open', 0.035)
+        self.declare_parameter('gripper_close', 0.00)
+
+        # Vertical snap setpoint for joint6 (legacy, unused in new alignment)
+        self.declare_parameter('vertical_joint6', 1.528)
+
+        # Approach distance (m) for grasp-only sequence
+        self.declare_parameter('approach_offset_x', 0.10)
+
+        # Cache a few params that rarely change; others read live in callback
+        self.ik_timeout = self.get_parameter('ik_timeout').get_parameter_value().double_value
+        self.ik_attempts = int(self.get_parameter('ik_attempts').get_parameter_value().integer_value)
+        self.ik_avoid_collisions = self.get_parameter('ik_avoid_collisions').get_parameter_value().bool_value
+
         self.via_above = self.get_parameter('via_above').get_parameter_value().double_value
         self.ompl_planner = self.get_parameter('ompl_planner').get_parameter_value().string_value
         self.allowed_planning_time = self.get_parameter('allowed_planning_time').get_parameter_value().double_value
@@ -141,6 +173,8 @@ class ArmPlannerRealRobotNode(Node):
         )
         self.get_logger().info("✅ Arm planner real robot service ready on 'grasp_from_pose'")
 
+    # ---------- utilities ----------
+
     def _apply_real_robot_optimizations(self):
         """Clamp parameters for safe real-robot usage."""
         self.speed = min(self.speed, 0.15)  # max 15% speed
@@ -157,10 +191,36 @@ class ArmPlannerRealRobotNode(Node):
             f"planner={self.ompl_planner}"
         )
 
+    def _clamp(self, v: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, v))
+
     def _on_js(self, msg: JointState):
         """Store latest joint state."""
         self._last_js = msg
 
+    def _wait_until_reached_joint_map(self, target_map: dict, tol: float = 0.02, timeout: float = 10.0) -> bool:
+        """Wait until current joints are within tol [rad] of target_map for all ARM_JOINTS."""
+        start = time.time()
+        while time.time() - start < timeout:
+            if self._last_js:
+                cur = dict(zip(self._last_js.name, self._last_js.position))
+                errs = []
+                ok = True
+                for j in ARM_JOINTS:
+                    if j not in cur or j not in target_map:
+                        ok = False
+                        break
+                    e = abs(cur[j] - float(target_map[j]))
+                    errs.append(e)
+                    if e > tol:
+                        ok = False
+                if ok:
+                    self.get_logger().info(f"Reached joint target (max err={max(errs):.4f} rad)")
+                    return True
+            rclpy.spin_once(self, timeout_sec=0.05)
+        self.get_logger().warn("Timed out waiting for joints to reach target")
+        return False
+    
     def _wait_until_settled(self, still_time: float = 2.0):
         """Just wait a bit between segments."""
         if self._last_js is None:
@@ -169,11 +229,59 @@ class ArmPlannerRealRobotNode(Node):
         self.get_logger().info(f"Waiting {still_time}s for robot to settle...")
         time.sleep(still_time)
 
+    # ---------- tiny math helpers (kept minimal to avoid side-effects) ----------
+
+    def _wrap_to_pi(self, a: float) -> float:
+        return math.atan2(math.sin(a), math.cos(a))
+
+    def _quat_to_rot(self, x: float, y: float, z: float, w: float) -> List[List[float]]:
+        # Normalize defensively
+        n = math.sqrt(x*x + y*y + z*z + w*w)
+        if n < 1e-12:
+            return [[1,0,0],[0,1,0],[0,0,1]]
+        x, y, z, w = x/n, y/n, z/n, w/n
+        xx, yy, zz = x*x, y*y, z*z
+        xy, xz, yz = x*y, x*z, y*z
+        wx, wy, wz = w*x, w*y, w*z
+        return [
+            [1-2*(yy+zz),     2*(xy-wz),     2*(xz+wy)],
+            [    2*(xy+wz), 1-2*(xx+zz),     2*(yz-wx)],
+            [    2*(xz-wy),     2*(yz+wx), 1-2*(xx+yy)]
+        ]
+
+    def _R_mul_v(self, R: List[List[float]], v: List[float]) -> List[float]:
+        return [
+            R[0][0]*v[0] + R[0][1]*v[1] + R[0][2]*v[2],
+            R[1][0]*v[0] + R[1][1]*v[1] + R[1][2]*v[2],
+            R[2][0]*v[0] + R[2][1]*v[1] + R[2][2]*v[2]
+        ]
+
+    def _v_dot(self, a: List[float], b: List[float]) -> float:
+        return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]
+
+    def _v_sub(self, a: List[float], b: List[float]) -> List[float]:
+        return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]
+
+    def _v_scale(self, a: List[float], s: float) -> List[float]:
+        return [a[0]*s, a[1]*s, a[2]*s]
+
+    def _v_norm(self, a: List[float]) -> float:
+        return math.sqrt(self._v_dot(a, a))
+
+    def _v_unit(self, a: List[float]) -> List[float]:
+        n = self._v_norm(a)
+        return [v/n for v in a] if n > 1e-12 else [0.0, 0.0, 0.0]
+
+    # ---------- gripper ----------
+
     def move_gripper(self, position: float) -> bool:
         """Move gripper (joint7) to position [m]."""
         if not self.grip_ac.server_is_ready():
             self.get_logger().error("Gripper controller not available")
             return False
+
+        # Safeguard: clamp to a sensible hardware range
+        position = self._clamp(position, 0.0, 0.035)  # adjust upper bound to your hardware
 
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = JointTrajectory()
@@ -210,6 +318,8 @@ class ArmPlannerRealRobotNode(Node):
 
         self.get_logger().info("  ✓ gripper moved")
         return True
+
+    # ---------- FK / IK ----------
 
     def _get_current_ee_orientation(self) -> Optional[Tuple[float, float, float, float]]:
         """Use /compute_fk to get current EE orientation (if service available)."""
@@ -255,10 +365,14 @@ class ArmPlannerRealRobotNode(Node):
 
         req = GetPositionIK.Request()
         req.ik_request.group_name = self.arm_group
+        req.ik_request.ik_link_name = self.ee_link  # ensure IK is solved for EE
         req.ik_request.pose_stamped = pose
         req.ik_request.robot_state.joint_state = self._last_js
         req.ik_request.timeout = Duration(sec=0, nanosec=int(timeout * 1e9))
-        req.ik_request.avoid_collisions = True
+        req.ik_request.avoid_collisions = self.ik_avoid_collisions
+
+        # NOTE: Many MoveIt2 builds do NOT expose PositionIKRequest.attempts
+        # Do NOT set req.ik_request.attempts here.
 
         future = self.ik_client.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=timeout + 0.5)
@@ -274,44 +388,52 @@ class ArmPlannerRealRobotNode(Node):
         return res.solution.joint_state
 
     def _compute_ik_position_only(self, x: float, y: float, z: float) -> Optional[JointState]:
-        """Position-only mode: Try many orientations until one IK solution is found."""
-        self.get_logger().info(
-            "Position-only mode: orientation is NOT constrained; sampling multiple orientations for IK."
-        )
+        self.get_logger().info("Position-only mode: sampling orientations for IK.")
 
         candidates: List[Tuple[float, float, float, float]] = []
 
-        # 1) Try current EE orientation first (if we can get it)
+        # Prefer useful real-world orientations first (tool down + yaw sweep)
+        for yaw in [0.0, math.pi/2, -math.pi/2, math.pi]:
+            candidates.append(quaternion_from_euler(0.0, math.pi/2, yaw))
+
+        # Current EE orientation (if FK available)
         cur_q = self._get_current_ee_orientation()
         if cur_q is not None:
-            self.get_logger().info("  Adding current EE orientation as first IK seed")
-            candidates.append(cur_q)
+            candidates.insert(0, cur_q)
 
-        # 2) Some "nice" default orientations
-        candidates.append((0.0, 0.0, 0.0, 1.0))  # identity
-
-        # 3) Sample yaw around Z, with no tilt
-        yaw_samples = [0.0, math.pi / 2, -math.pi / 2, math.pi, -math.pi]
-        for yaw in yaw_samples:
+        # Identity and yaw-only (no tilt)
+        candidates.append((0.0, 0.0, 0.0, 1.0))
+        for yaw in [0.0, math.pi/2, -math.pi/2, math.pi]:
             candidates.append(quaternion_from_euler(0.0, 0.0, yaw))
 
-        # 4) Mild tilt in pitch at a few yaws
-        tilt = math.radians(30)
-        for yaw in [0.0, math.pi / 2, -math.pi / 2]:
-            for pitch in (-tilt, tilt):
+        # Broaden coverage with extra tilts/rolls
+        for pitch in [math.radians(a) for a in (-90, -60, -30, 30, 60, 90)]:
+            for yaw in [0.0, math.pi/2, -math.pi/2, math.pi]:
                 candidates.append(quaternion_from_euler(0.0, pitch, yaw))
+        for roll in [math.pi/2, -math.pi/2]:
+            for yaw in [0.0, math.pi/2, -math.pi/2, math.pi]:
+                candidates.append(quaternion_from_euler(roll, 0.0, yaw))
 
-        # Try each candidate
+        # Try each, with a slightly longer per-sample timeout (scaled from ik_timeout)
+        per_sample_timeout = max(0.1, self.ik_timeout * 0.6)
+
+        seen = set()
         for idx, q in enumerate(candidates, start=1):
+            # de-duplicate near-identical quats
+            key = tuple(round(v, 3) for v in q)
+            if key in seen:
+                continue
+            seen.add(key)
+
             self.get_logger().info(f"  Trying IK sample {idx}/{len(candidates)} ...")
-            js = self._compute_ik_single(x, y, z, q, timeout=0.05)
+            js = self._compute_ik_single(x, y, z, q, timeout=per_sample_timeout)
             if js is not None:
                 self.get_logger().info("  -> IK sample succeeded")
                 return js
 
         self.get_logger().error(
-            "IK failed for all sampled orientations in position-only mode.\n"
-            "  → Either the point is outside the workspace or in unavoidable collision."
+            "IK failed for all sampled orientations in position-only mode "
+            "(likely collision or pose outside reachable set)."
         )
         return None
 
@@ -327,19 +449,26 @@ class ArmPlannerRealRobotNode(Node):
             self.get_logger().error("IK failed for the requested orientation.")
         return js
 
+    # ---------- MoveIt goal building & sending ----------
+
     def _make_joint_goal_from_ik(self, target_js: JointState) -> Optional[MoveGroup.Goal]:
-        """Create a MoveGroup joint-space goal from an IK joint_state."""
         goal = MoveGroup.Goal()
         req = goal.request
-
         req.group_name = self.arm_group
         req.num_planning_attempts = self.planning_attempts
         req.allowed_planning_time = self.allowed_planning_time
         req.max_velocity_scaling_factor = self.speed
         req.max_acceleration_scaling_factor = self.speed
-
         if self.ompl_planner:
             req.planner_id = self.ompl_planner
+
+        # fetch latest tolerances (supports live tuning via ros2 param set)
+        tol_deg = self.get_parameter('joint_tolerance_deg').get_parameter_value().double_value
+        if tol_deg > 0.0:
+            tol_above = tol_below = math.radians(tol_deg)
+        else:
+            tol_above = self.get_parameter('joint_tolerance_above').get_parameter_value().double_value
+            tol_below = self.get_parameter('joint_tolerance_below').get_parameter_value().double_value
 
         c = Constraints()
         joint_map = dict(zip(target_js.name, target_js.position))
@@ -351,8 +480,8 @@ class ArmPlannerRealRobotNode(Node):
             jc = JointConstraint()
             jc.joint_name = j
             jc.position = float(joint_map[j])
-            jc.tolerance_above = 0.01
-            jc.tolerance_below = 0.01
+            jc.tolerance_above = float(tol_above)
+            jc.tolerance_below = float(tol_below)
             jc.weight = 1.0
             c.joint_constraints.append(jc)
 
@@ -361,11 +490,51 @@ class ArmPlannerRealRobotNode(Node):
             return None
 
         req.goal_constraints = [c]
-
         goal.planning_options.plan_only = False
         goal.planning_options.replan = True
         goal.planning_options.replan_attempts = 2
+        return goal
 
+    def _make_joint_goal_from_positions(self, joint_map: Dict[str, float]) -> Optional[MoveGroup.Goal]:
+        """Build a MoveGroup goal from a dict of joint -> target position (rad)."""
+        goal = MoveGroup.Goal()
+        req = goal.request
+        req.group_name = self.arm_group
+        req.num_planning_attempts = self.planning_attempts
+        req.allowed_planning_time = self.allowed_planning_time
+        req.max_velocity_scaling_factor = self.speed
+        req.max_acceleration_scaling_factor = self.speed
+        if self.ompl_planner:
+            req.planner_id = self.ompl_planner
+
+        tol_deg = self.get_parameter('joint_tolerance_deg').get_parameter_value().double_value
+        if tol_deg > 0.0:
+            tol_above = tol_below = math.radians(tol_deg)
+        else:
+            tol_above = self.get_parameter('joint_tolerance_above').get_parameter_value().double_value
+            tol_below = self.get_parameter('joint_tolerance_below').get_parameter_value().double_value
+
+        c = Constraints()
+        for j in ARM_JOINTS:
+            if j not in joint_map:
+                self.get_logger().warn(f"Joint {j} not provided in joint_map, skipping")
+                continue
+            jc = JointConstraint()
+            jc.joint_name = j
+            jc.position = float(joint_map[j])
+            jc.tolerance_above = float(tol_above)
+            jc.tolerance_below = float(tol_below)
+            jc.weight = 1.0
+            c.joint_constraints.append(jc)
+
+        if not c.joint_constraints:
+            self.get_logger().error("No joint constraints created from joint_map")
+            return None
+
+        req.goal_constraints = [c]
+        goal.planning_options.plan_only = False
+        goal.planning_options.replan = True
+        goal.planning_options.replan_attempts = 2
         return goal
 
     def _send_moveit_goal(self, goal: MoveGroup.Goal) -> bool:
@@ -397,6 +566,112 @@ class ArmPlannerRealRobotNode(Node):
         self.get_logger().info("  ✓ MoveIt planning + execution succeeded")
         return True
 
+    # ---------- specialized steps ----------
+
+    def _align_joint6_x_to_base_y(self) -> Optional[float]:
+        """
+        Rotate ONLY joint6 so that link6's X-axis is parallel to base_link's Y-axis (±).
+        Returns the target joint6 angle (rad) if a motion was sent (or already aligned),
+        otherwise None on failure.
+        """
+        if self._last_js is None:
+            self.get_logger().error("No joint state for alignment")
+            return None
+
+        cur_map = dict(zip(self._last_js.name, self._last_js.position))
+        if 'joint6' not in cur_map:
+            self.get_logger().error("joint6 not in current joint state")
+            return None
+
+        # Get current link6 orientation in base_link
+        q = self._get_current_ee_orientation()
+        if q is None:
+            self.get_logger().error("FK not available to get link6 orientation")
+            return None
+        qx, qy, qz, qw = q
+        R = self._quat_to_rot(qx, qy, qz, qw)  # base_link <- link6
+
+        # link6 axes expressed in base_link
+        x6 = self._R_mul_v(R, [1,0,0])
+
+        # Assume joint6 axis is z of link6 (typical wrist roll); express in base_link
+        a = self._v_unit(self._R_mul_v(R, [0,0,1]))
+
+        # Targets: +Y and -Y of base_link
+        t1 = [0, 1, 0]
+        t2 = [0,-1, 0]
+
+        # Project onto plane orthogonal to a
+        def proj_on_plane(v, n):
+            return self._v_sub(v, self._v_scale(n, self._v_dot(v, n)))
+
+        v  = proj_on_plane(x6, a);  v_n  = self._v_unit(v)
+        u1 = proj_on_plane(t1, a);  u1_n = self._v_unit(u1)
+        u2 = proj_on_plane(t2, a);  u2_n = self._v_unit(u2)
+
+        # If projection is tiny, rotation about a cannot help -> treat as aligned
+        if self._v_norm(v) < 1e-6 or self._v_norm(u1) < 1e-6:
+            self.get_logger().info("link6.x is nearly parallel to joint6 axis; nothing to align.")
+            return cur_map['joint6']
+
+        # Signed angle around axis a from v -> u : atan2(a·(v×u), v·u)
+        def signed_angle(vn, un, axis):
+            c = self._v_dot(vn, un)
+            s = axis[0]*(vn[1]*un[2]-vn[2]*un[1]) + axis[1]*(vn[2]*un[0]-vn[0]*un[2]) + axis[2]*(vn[0]*un[1]-vn[1]*un[0])
+            return math.atan2(s, c)
+
+        d1 = self._wrap_to_pi(signed_angle(v_n, u1_n, a))
+        d2 = self._wrap_to_pi(signed_angle(v_n, u2_n, a))
+        d  = d1 if abs(d1) <= abs(d2) else d2
+
+        # Small tolerance to avoid micro motions (5 deg)
+        tol_rad = math.radians(5.0)
+        if abs(d) <= tol_rad:
+            self.get_logger().info(f"link6.x is already within {math.degrees(tol_rad):.1f}° of base Y (Δ={math.degrees(d):.2f}°).")
+            return cur_map['joint6']
+
+        target_j6 = self._wrap_to_pi(cur_map['joint6'] + d)
+        arm_joint_map = {j: cur_map[j] for j in ARM_JOINTS if j in cur_map}
+        arm_joint_map['joint6'] = float(target_j6)
+
+        self.get_logger().info(f"Aligning link6.x to base Y: Δj6={math.degrees(d):.2f}°, target {target_j6:.3f} rad")
+        goal = self._make_joint_goal_from_positions(arm_joint_map)
+        if goal is None:
+            return None
+
+        if not self._send_moveit_goal(goal):
+            return None
+
+        return target_j6
+
+    def _snap_joint6_vertical(self) -> bool:
+        """After reaching the target pose, rotate ONLY joint6 to the vertical setpoint."""
+        if self._last_js is None:
+            self.get_logger().error("No joint state available to snap joint6 vertical")
+            return False
+
+        target_j6 = self.get_parameter('vertical_joint6').get_parameter_value().double_value
+
+        # Build a joint map from the latest state and override joint6
+        joint_map = dict(zip(self._last_js.name, self._last_js.position))
+        if 'joint6' not in joint_map:
+            self.get_logger().error("joint6 not found in current joint state")
+            return False
+
+        joint_map['joint6'] = float(target_j6)
+
+        # Only constrain the arm joints; ignore gripper joint here
+        arm_joint_map = {j: joint_map[j] for j in ARM_JOINTS if j in joint_map}
+
+        self.get_logger().info(f"Snapping joint6 to vertical: {target_j6:.3f} rad")
+        goal = self._make_joint_goal_from_positions(arm_joint_map)
+        if goal is None:
+            return False
+
+        return self._send_moveit_goal(goal)
+
+    # ---------- service ----------
+
     def grasp_from_pose_callback(self, request: GraspFromPose.Request, response: GraspFromPose.Response):
         """Service callback to handle grasp from pose requests."""
         self.get_logger().info("=" * 60)
@@ -415,17 +690,39 @@ class ArmPlannerRealRobotNode(Node):
             qz = pose.orientation.z
             qw = pose.orientation.w
 
+            # New flags (require updated .srv with 'place' and 'vertical')
+            place = getattr(request, 'place', False)
+            vertical = getattr(request, 'vertical', False)
+
             self.get_logger().info(
                 f"Received grasp request: pos=({x:.3f}, {y:.3f}, {z:.3f}), "
                 f"orient=({qx:.3f}, {qy:.3f}, {qz:.3f}, {qw:.3f}), "
-                f"grasp={request.grasp}, no_orientation={request.no_orientation}"
+                f"grasp={request.grasp}, place={place}, vertical={vertical}, "
+                f"no_orientation={request.no_orientation}"
             )
 
-            # Set gripper values based on grasp flag
-            gripper_before = 0.08 if request.grasp else 0.0
-            gripper_after = 0.0 if request.grasp else 0.0
+            # Read params live (tunable at runtime)
+            gripper_open  = self.get_parameter('gripper_open').get_parameter_value().double_value
+            gripper_close = self.get_parameter('gripper_close').get_parameter_value().double_value
+            approach_dx   = self.get_parameter('approach_offset_x').get_parameter_value().double_value
 
-            # Move gripper before
+            # Decide gripper strategy
+            if place and request.grasp:
+                self.get_logger().warn("Both 'place' and 'grasp' are true; prioritizing 'place' behavior.")
+
+            if place:
+                # place: start closed, open at target
+                gripper_before = gripper_close
+                gripper_after  = gripper_open
+            elif request.grasp:
+                # grasp: start open, close at target
+                gripper_before = gripper_open
+                gripper_after  = gripper_close
+            else:
+                gripper_before = None
+                gripper_after  = None
+
+            # Move gripper before (if requested)
             if gripper_before is not None:
                 self.get_logger().info(f"Moving gripper before motion to {gripper_before:.3f} m")
                 if not self.move_gripper(gripper_before):
@@ -449,45 +746,122 @@ class ArmPlannerRealRobotNode(Node):
                     "Position-only mode enabled. Orientation will be chosen automatically by IK search."
                 )
 
-            # Build segments (optional via-above)
-            segments: List[Tuple[float, float, float]] = []
-            if self.via_above > 1e-6:
-                segments.append((x, y, z + self.via_above))
-            segments.append((x, y, z))
-
-            self.get_logger().info(f"Planning {len(segments)} segment(s) with via_above={self.via_above:.3f}")
-
-            for i, (tx, ty, tz) in enumerate(segments, start=1):
-                self.get_logger().info(f"[{i}/{len(segments)}] Planning to ({tx:.3f}, {ty:.3f}, {tz:.3f})")
-
-                if i > 1:
-                    self._wait_until_settled()
-
+            # ------------- Special grasp-only sequence -------------
+            if request.grasp and not place:
+                # Step 1: approach to (x - approach_dx, y, z)
+                ax = x - approach_dx
+                self.get_logger().info(f"[approach] Planning to ({ax:.3f}, {y:.3f}, {z:.3f}) (dx={approach_dx:.3f})")
                 if position_only:
-                    ik_js = self._compute_ik_position_only(tx, ty, tz)
+                    ik_js = self._compute_ik_position_only(ax, y, z)
                 else:
-                    ik_js = self._compute_ik_oriented(tx, ty, tz, q_xyzw)  # type: ignore
+                    ik_js = self._compute_ik_oriented(ax, y, z, q_xyzw)  # type: ignore
 
                 if ik_js is None:
                     response.success = False
-                    response.message = f"IK failed for target pose at segment {i}/{len(segments)}"
+                    response.message = "IK failed for approach point"
                     return response
 
                 goal = self._make_joint_goal_from_ik(ik_js)
                 if goal is None:
                     response.success = False
-                    response.message = f"Failed to build joint-space goal from IK at segment {i}/{len(segments)}"
+                    response.message = "Failed to build goal for approach point"
                     return response
-
-                self.get_logger().info(f"Sending MoveIt goal for segment {i}/{len(segments)}...")
                 if not self._send_moveit_goal(goal):
-                    self.get_logger().error(f"MoveIt planning/execution failed at segment {i}/{len(segments)}")
                     response.success = False
-                    response.message = f"MoveIt planning/execution failed at segment {i}/{len(segments)}"
+                    response.message = "MoveIt failed for approach point"
                     return response
-                self.get_logger().info(f"Segment {i}/{len(segments)} completed successfully")
 
-            # Move gripper after
+                # Ensure fully reached and settled
+                self._wait_until_reached_joint_map(dict(zip(ik_js.name, ik_js.position)), tol=0.02, timeout=15.0)
+                self._wait_until_settled()
+
+                # Step 2: rotate link6.x || base_link.y (alignment)
+                target_j6 = self._align_joint6_x_to_base_y()
+                if target_j6 is None:
+                    response.success = False
+                    response.message = "Failed to align joint6 (link6.x || base_link.y)"
+                    return response
+                self._wait_until_reached_joint_map({'joint6': target_j6}, tol=0.03, timeout=12.0)
+                self._wait_until_settled()
+
+                # Step 3: final short move to (x, y, z)
+                self.get_logger().info(f"[final] Planning to ({x:.3f}, {y:.3f}, {z:.3f})")
+                if position_only:
+                    ik_js = self._compute_ik_position_only(x, y, z)
+                else:
+                    ik_js = self._compute_ik_oriented(x, y, z, q_xyzw)  # type: ignore
+
+                if ik_js is None:
+                    response.success = False
+                    response.message = "IK failed for final target"
+                    return response
+
+                goal = self._make_joint_goal_from_ik(ik_js)
+                if goal is None:
+                    response.success = False
+                    response.message = "Failed to build goal for final target"
+                    return response
+                if not self._send_moveit_goal(goal):
+                    response.success = False
+                    response.message = "MoveIt failed for final target"
+                    return response
+
+                self._wait_until_reached_joint_map(dict(zip(ik_js.name, ik_js.position)), tol=0.02, timeout=15.0)
+                self._wait_until_reached_joint_map(dict(zip(ik_js.name, ik_js.position)), tol=0.3, timeout=3.0)
+
+            # ------------- Default behavior (place or neutral) -------------
+            else:
+                # Build segments (optional via-above)
+                segments: List[Tuple[float, float, float]] = []
+                if self.via_above > 1e-6:
+                    segments.append((x, y, z + self.via_above))
+                segments.append((x, y, z))
+
+                self.get_logger().info(f"Planning {len(segments)} segment(s) with via_above={self.via_above:.3f}")
+
+                for i, (tx, ty, tz) in enumerate(segments, start=1):
+                    self.get_logger().info(f"[{i}/{len(segments)}] Planning to ({tx:.3f}, {ty:.3f}, {tz:.3f})")
+
+                    if i > 1:
+                        self._wait_until_settled()
+
+                    if position_only:
+                        ik_js = self._compute_ik_position_only(tx, ty, tz)
+                    else:
+                        ik_js = self._compute_ik_oriented(tx, ty, tz, q_xyzw)  # type: ignore
+
+                    if ik_js is None:
+                        response.success = False
+                        response.message = f"IK failed for target pose at segment {i}/{len(segments)}"
+                        return response
+
+                    goal = self._make_joint_goal_from_ik(ik_js)
+                    if goal is None:
+                        response.success = False
+                        response.message = f"Failed to build joint-space goal from IK at segment {i}/{len(segments)}"
+                        return response
+
+                    self.get_logger().info(f"Sending MoveIt goal for segment {i}/{len(segments)}...")
+                    if not self._send_moveit_goal(goal):
+                        self.get_logger().error(f"MoveIt planning/execution failed at segment {i}/{len(segments)}")
+                        response.success = False
+                        response.message = f"MoveIt planning/execution failed at segment {i}/{len(segments)}"
+                        return response
+                    self.get_logger().info(f"Segment {i}/{len(segments)} completed successfully")
+                    self._wait_until_reached_joint_map(dict(zip(ik_js.name, ik_js.position)), tol=0.02, timeout=15.0)
+
+                # Optional post-target "vertical" alignment (kept same as your version)
+                if vertical:
+                    target_j6 = self._align_joint6_x_to_base_y()
+                    if target_j6 is None:
+                        response.success = False
+                        response.message = "Failed to align joint6 (link6.x) with base_link.y"
+                        return response
+                    self._wait_until_reached_joint_map({'joint6': target_j6}, tol=0.3, timeout=3.0)
+                else:
+                    self._wait_until_reached_joint_map(dict(zip(ik_js.name, ik_js.position)), tol=0.3, timeout=3.0)
+
+            # Move gripper after (if requested)
             if gripper_after is not None:
                 self.get_logger().info("Moving gripper at final position...")
                 if not self.move_gripper(gripper_after):
@@ -528,4 +902,3 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
-
