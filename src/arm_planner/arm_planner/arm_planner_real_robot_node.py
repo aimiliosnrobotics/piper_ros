@@ -96,6 +96,17 @@ class ArmPlannerRealRobotNode(Node):
         # Approach distance (m) for grasp-only sequence
         self.declare_parameter('approach_offset_x', 0.10)
 
+        # --------- NEW: faster, tunable waits ----------
+        # settle time between segments (seconds)
+        self.declare_parameter('settle_time', 0.8)
+        # geometric alignment tolerance (degrees) for link6.x ∥ base_link.y
+        self.declare_parameter('align_tol_deg', 6.0)
+        # timeouts (seconds)
+        self.declare_parameter('align_wait_timeout', 2.5)
+        self.declare_parameter('segment_wait_timeout', 4.0)
+        self.declare_parameter('final_wait_timeout', 1.5)
+        # -----------------------------------------------
+
         # Cache a few params that rarely change; others read live in callback
         self.ik_timeout = self.get_parameter('ik_timeout').get_parameter_value().double_value
         self.ik_attempts = int(self.get_parameter('ik_attempts').get_parameter_value().integer_value)
@@ -198,9 +209,10 @@ class ArmPlannerRealRobotNode(Node):
         """Store latest joint state."""
         self._last_js = msg
 
-    def _wait_until_reached_joint_map(self, target_map: dict, tol: float = 0.02, timeout: float = 10.0) -> bool:
+    def _wait_until_reached_joint_map(self, target_map: dict, tol: float = 0.02, timeout: float = 1.0) -> bool:
         """Wait until current joints are within tol [rad] of target_map for all ARM_JOINTS."""
         start = time.time()
+        last_max_err = None
         while time.time() - start < timeout:
             if self._last_js:
                 cur = dict(zip(self._last_js.name, self._last_js.position))
@@ -217,17 +229,24 @@ class ArmPlannerRealRobotNode(Node):
                 if ok:
                     self.get_logger().info(f"Reached joint target (max err={max(errs):.4f} rad)")
                     return True
-            rclpy.spin_once(self, timeout_sec=0.05)
-        self.get_logger().warn("Timed out waiting for joints to reach target")
+                if errs:
+                    last_max_err = max(errs)
+            rclpy.spin_once(self, timeout_sec=0.02)
+        if last_max_err is not None:
+            self.get_logger().warn(f"Timed out waiting for joints to reach target (max err≈{last_max_err:.3f} rad)")
+        else:
+            self.get_logger().warn("Timed out waiting for joints to reach target")
         return False
-    
-    def _wait_until_settled(self, still_time: float = 2.0):
+
+    def _wait_until_settled(self, still_time: Optional[float] = None):
         """Just wait a bit between segments."""
         if self._last_js is None:
             self.get_logger().warn("No joint state received, skipping settle wait")
             return
-        self.get_logger().info(f"Waiting {still_time}s for robot to settle...")
-        time.sleep(still_time)
+        t = still_time if still_time is not None else \
+            self.get_parameter('settle_time').get_parameter_value().double_value
+        self.get_logger().info(f"Waiting {t:.2f}s for robot to settle...")
+        time.sleep(t)
 
     # ---------- tiny math helpers (kept minimal to avoid side-effects) ----------
 
@@ -566,6 +585,47 @@ class ArmPlannerRealRobotNode(Node):
         self.get_logger().info("  ✓ MoveIt planning + execution succeeded")
         return True
 
+    # ---------- alignment helpers (fast, geometric) ----------
+
+    def _current_link6x_angle_to_base_y(self) -> Optional[float]:
+        """
+        Returns the smallest angle (rad) between link6.x and ±base_link.y (None if FK unavailable).
+        """
+        q = self._get_current_ee_orientation()
+        if q is None:
+            return None
+        qx, qy, qz, qw = q
+        R = self._quat_to_rot(qx, qy, qz, qw)  # base_link <- link6
+        x6 = self._R_mul_v(R, [1, 0, 0])       # link6.x in base_link
+        # compare to ±Y: use |dot| to be indifferent to sign
+        dot = abs(self._v_dot(self._v_unit(x6), [0, 1, 0]))
+        dot = max(-1.0, min(1.0, dot))
+        return math.acos(dot)
+
+    def _wait_until_link6x_parallel_base_y(self, tol_deg: float, timeout: float) -> bool:
+        """
+        Wait until link6.x is within tol_deg of parallel to base_link.y (either +Y or -Y).
+        Falls back to success if FK isn't available (to avoid blocking).
+        """
+        tol_rad = math.radians(tol_deg)
+        start = time.time()
+        last_ang = None
+        while time.time() - start < timeout:
+            ang = self._current_link6x_angle_to_base_y()
+            if ang is None:
+                self.get_logger().warn("FK not available during alignment wait; skipping geometric check.")
+                return True  # don't block if FK is down
+            last_ang = ang
+            if ang <= tol_rad:
+                self.get_logger().info(f"link6.x ∥ base_link.y within {tol_deg:.1f}° (Δ={math.degrees(ang):.2f}°)")
+                return True
+            rclpy.spin_once(self, timeout_sec=0.02)
+        if last_ang is not None:
+            self.get_logger().warn(f"Alignment timeout (Δ≈{math.degrees(last_ang):.2f}° > {tol_deg:.1f}°)")
+        else:
+            self.get_logger().warn("Alignment timeout (no FK data)")
+        return False
+
     # ---------- specialized steps ----------
 
     def _align_joint6_x_to_base_y(self) -> Optional[float]:
@@ -706,6 +766,11 @@ class ArmPlannerRealRobotNode(Node):
             gripper_close = self.get_parameter('gripper_close').get_parameter_value().double_value
             approach_dx   = self.get_parameter('approach_offset_x').get_parameter_value().double_value
 
+            align_tol_deg     = self.get_parameter('align_tol_deg').get_parameter_value().double_value
+            align_wait_timeout= self.get_parameter('align_wait_timeout').get_parameter_value().double_value
+            segment_wait_to   = self.get_parameter('segment_wait_timeout').get_parameter_value().double_value
+            final_wait_to     = self.get_parameter('final_wait_timeout').get_parameter_value().double_value
+
             # Decide gripper strategy
             if place and request.grasp:
                 self.get_logger().warn("Both 'place' and 'grasp' are true; prioritizing 'place' behavior.")
@@ -771,8 +836,8 @@ class ArmPlannerRealRobotNode(Node):
                     response.message = "MoveIt failed for approach point"
                     return response
 
-                # Ensure fully reached and settled
-                self._wait_until_reached_joint_map(dict(zip(ik_js.name, ik_js.position)), tol=0.02, timeout=15.0)
+                # Ensure fully reached and settled (short)
+                self._wait_until_reached_joint_map(dict(zip(ik_js.name, ik_js.position)), tol=0.02, timeout=segment_wait_to)
                 self._wait_until_settled()
 
                 # Step 2: rotate link6.x || base_link.y (alignment)
@@ -781,7 +846,9 @@ class ArmPlannerRealRobotNode(Node):
                     response.success = False
                     response.message = "Failed to align joint6 (link6.x || base_link.y)"
                     return response
-                self._wait_until_reached_joint_map({'joint6': target_j6}, tol=0.03, timeout=12.0)
+
+                # FAST geometric wait instead of joint6 angle wait
+                self._wait_until_link6x_parallel_base_y(align_tol_deg, align_wait_timeout)
                 self._wait_until_settled()
 
                 # Step 3: final short move to (x, y, z)
@@ -806,8 +873,8 @@ class ArmPlannerRealRobotNode(Node):
                     response.message = "MoveIt failed for final target"
                     return response
 
-                self._wait_until_reached_joint_map(dict(zip(ik_js.name, ik_js.position)), tol=0.02, timeout=15.0)
-                self._wait_until_reached_joint_map(dict(zip(ik_js.name, ik_js.position)), tol=0.3, timeout=3.0)
+                self._wait_until_reached_joint_map(dict(zip(ik_js.name, ik_js.position)), tol=0.02, timeout=segment_wait_to)
+                self._wait_until_reached_joint_map(dict(zip(ik_js.name, ik_js.position)), tol=0.3, timeout=final_wait_to)
 
             # ------------- Default behavior (place or neutral) -------------
             else:
@@ -848,18 +915,19 @@ class ArmPlannerRealRobotNode(Node):
                         response.message = f"MoveIt planning/execution failed at segment {i}/{len(segments)}"
                         return response
                     self.get_logger().info(f"Segment {i}/{len(segments)} completed successfully")
-                    self._wait_until_reached_joint_map(dict(zip(ik_js.name, ik_js.position)), tol=0.02, timeout=15.0)
+                    self._wait_until_reached_joint_map(dict(zip(ik_js.name, ik_js.position)), tol=0.02, timeout=segment_wait_to)
 
-                # Optional post-target "vertical" alignment (kept same as your version)
+                # Optional post-target "vertical" alignment (same functional intent; faster wait)
                 if vertical:
                     target_j6 = self._align_joint6_x_to_base_y()
                     if target_j6 is None:
                         response.success = False
                         response.message = "Failed to align joint6 (link6.x) with base_link.y"
                         return response
-                    self._wait_until_reached_joint_map({'joint6': target_j6}, tol=0.3, timeout=3.0)
+                    # geometric wait here too (faster & robust)
+                    self._wait_until_link6x_parallel_base_y(align_tol_deg, align_wait_timeout)
                 else:
-                    self._wait_until_reached_joint_map(dict(zip(ik_js.name, ik_js.position)), tol=0.3, timeout=3.0)
+                    self._wait_until_reached_joint_map(dict(zip(ik_js.name, ik_js.position)), tol=0.3, timeout=final_wait_to)
 
             # Move gripper after (if requested)
             if gripper_after is not None:
