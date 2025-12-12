@@ -297,7 +297,7 @@ class PiperRosNode(Node):
 
         # 遍历joint_data.name来映射位置
         for idx, joint_name in enumerate(joint_data.name):
-            self.get_logger().info(f"{joint_name}: {joint_data.position[idx]}")
+            # self.get_logger().info(f"{joint_name}: {joint_data.position[idx]}")  # Commented out to reduce log spam
             joint_positions[joint_name] = round(joint_data.position[idx] * factor)
         
         # 获取第7个关节的位置
