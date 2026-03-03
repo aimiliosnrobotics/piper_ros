@@ -6,10 +6,10 @@ import yaml
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, RegisterEventHandler, TimerAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.actions import Node
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
 from launch.event_handlers import OnProcessStart
 
 from moveit_configs_utils import MoveItConfigsBuilder
@@ -97,11 +97,10 @@ def generate_launch_description():
 
     _add_move_group_safe(ld, moveit_config)
     _add_rviz_safe(ld, moveit_config)
-    
-    # Add ros2_control and controllers (like demo.launch.py does)
-    # This provides the action servers that MoveIt needs
-    cm_node = _add_ros2_control(ld, moveit_config)
-    _add_spawn_controllers(ld, moveit_config, cm_node)
+
+    # Only spawn ros2_control + controllers for real robot.
+    # In simulation (use_sim_time=True), Gazebo already provides them.
+    _add_ros2_control_real_only(ld, moveit_config)
 
     return ld
 
@@ -238,8 +237,12 @@ def _add_rviz_safe(ld: LaunchDescription, moveit_config):
     )
 
 
-def _add_ros2_control(ld: LaunchDescription, moveit_config):
-    """Add ros2_control node (like demo.launch.py) - provides action servers"""
+def _add_ros2_control_real_only(ld: LaunchDescription, moveit_config):
+    """Add ros2_control + controllers only when NOT in simulation.
+    Gazebo already provides its own controller_manager and spawns controllers,
+    so launching a second one causes 'already loaded' errors and CONTROL_FAILED."""
+    not_sim = UnlessCondition(LaunchConfiguration("use_sim_time"))
+
     cm_node = Node(
         package="controller_manager",
         executable="ros2_control_node",
@@ -249,18 +252,15 @@ def _add_ros2_control(ld: LaunchDescription, moveit_config):
             str(moveit_config.package_path / "config/ros2_controllers.yaml"),
         ],
         output="screen",
+        condition=not_sim,
     )
     ld.add_action(cm_node)
-    return cm_node
 
-
-def _add_spawn_controllers(ld: LaunchDescription, moveit_config, cm_node: Node):
-    """Add controller spawners (like demo.launch.py) - spawns arm_controller and gripper_controller"""
-    # Delay spawning until ros2_control_node has started to avoid races
     spawn_include = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             str(moveit_config.package_path / "launch/spawn_controllers.launch.py")
         ),
+        condition=not_sim,
     )
     ld.add_action(
         RegisterEventHandler(

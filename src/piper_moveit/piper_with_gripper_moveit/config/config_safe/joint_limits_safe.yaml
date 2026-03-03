@@ -1,41 +1,41 @@
-# These scale defaults are only the UI/MotionRequest defaults.
-# Your script still controls scaling at runtime.
+# Joint limits matched to URDF hardware spec.
+# Runtime scaling is controlled by --speed and --accel flags.
 default_velocity_scaling_factor: 0.3
 default_acceleration_scaling_factor: 0.3
 
 joint_limits:
   joint1:
     has_velocity_limits: true
-    max_velocity: 8.0  # Further increased for CHOMP
+    max_velocity: 5.0
     has_acceleration_limits: true
-    max_acceleration: 8.0  # Further increased for CHOMP
+    max_acceleration: 5.0
   joint2:
     has_velocity_limits: true
-    max_velocity: 8.0  # Further increased for CHOMP
+    max_velocity: 5.0
     has_acceleration_limits: true
-    max_acceleration: 8.0  # Further increased for CHOMP
+    max_acceleration: 5.0
   joint3:
     has_velocity_limits: true
-    max_velocity: 8.0  # Further increased for CHOMP
+    max_velocity: 5.0
     has_acceleration_limits: true
-    max_acceleration: 8.0  # Further increased for CHOMP
+    max_acceleration: 5.0
   joint4:
     has_velocity_limits: true
-    max_velocity: 8.0
+    max_velocity: 5.0
     has_acceleration_limits: true
-    max_acceleration: 8.0
+    max_acceleration: 5.0
   joint5:
     has_velocity_limits: true
-    max_velocity: 8.0
+    max_velocity: 5.0
     has_acceleration_limits: true
-    max_acceleration: 8.0
+    max_acceleration: 5.0
   joint6:
     has_velocity_limits: true
-    max_velocity: 6.0  # Further increased for CHOMP
+    max_velocity: 3.0
     has_acceleration_limits: true
-    max_acceleration: 8.0
+    max_acceleration: 3.0
   joint7:
     has_velocity_limits: true
-    max_velocity: 2.0  # Further increased for CHOMP
+    max_velocity: 1.0
     has_acceleration_limits: true
-    max_acceleration: 4.0
+    max_acceleration: 2.0

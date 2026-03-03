@@ -92,7 +92,7 @@ def quat_align_tool_axis_to(world_dir, tool_axis, roll_around_axis=0.0):
         axis = _cross(tz, wd); angle = math.acos(dot)
         q_align = _quat_from_axis_angle(axis, angle)
     q_roll = _quat_from_axis_angle(wd, roll_around_axis)
-    return _quat_mul(q_align, q_roll)
+    return _quat_mul(q_roll, q_align)
 
 
 # ----------------- main node -----------------
@@ -391,14 +391,16 @@ class ProductionPlanner(Node):
             # For Pilz planners, use simplified constraints (position only)
             use_pilz_simple = (use_pipeline == 'pilz_industrial_motion_planner')
             use_joint_only = (not use_pilz_simple and joint_cs)
-            
-            # For Pilz planners, disable all complex constraints
+
+            # Use local variable to avoid mutating the user's orientation for later segments
             if use_pilz_simple:
-                joint_cs = []  # Clear joint constraints for Pilz
-                q_xyzw = None  # Clear orientation constraints for Pilz
+                joint_cs = []
+                seg_q_xyzw = None
                 use_joint_only = False
-            
-            gc = self._make_goal_constraints(tx, ty, tz, q_xyzw=q_xyzw, joint_constraints=joint_cs, 
+            else:
+                seg_q_xyzw = q_xyzw
+
+            gc = self._make_goal_constraints(tx, ty, tz, q_xyzw=seg_q_xyzw, joint_constraints=joint_cs,
                                            use_joint_only=use_joint_only, use_pilz_simple=use_pilz_simple,
                                            orientation_weight=orientation_weight)
 
@@ -434,8 +436,8 @@ def build_argparser():
                    help='Spin about aligned axis (rad).')
 
     # Tolerances
-    p.add_argument('--pos-box', type=float, default=0.02, help='Half-size (m) of goal position box.')
-    p.add_argument('--goal-ang-tol-deg', type=float, default=6.0, help='Goal orientation tolerance (deg).')
+    p.add_argument('--pos-box', type=float, default=0.05, help='Half-size (m) of goal position box.')
+    p.add_argument('--goal-ang-tol-deg', type=float, default=15.0, help='Goal orientation tolerance (deg).')
     p.add_argument('--lock-orientation-on-path', action='store_true', help='Constrain orientation along the path.')
     p.add_argument('--path-ang-tol-deg', type=float, default=8.0, help='Path orientation tolerance (deg).')
     

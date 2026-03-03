@@ -13,7 +13,7 @@ ompl:
     default_planner_request_adapters/FixStartStateBounds
     default_planner_request_adapters/FixStartStateCollision
     default_planner_request_adapters/FixStartStatePathConstraints
-  start_state_max_bounds_error: 0.15
+  start_state_max_bounds_error: 0.05
   default_workspace_bounds: 5.0
   jiggle_fraction: 0.05
   max_sampling_attempts: 100
